@@ -174,6 +174,10 @@ void *spdm_server_init(void)
     if (m_use_capability_flags != 0) {
         m_use_responder_capability_flags = m_use_capability_flags;
     }
+    /* Test keys do not use the software sample's key-pair inventory. */
+    m_use_responder_capability_flags &=
+        ~(SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_GET_KEY_PAIR_INFO_CAP |
+          SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_SET_KEY_PAIR_INFO_CAP);
     max_spdm_msg_size = LIBSPDM_MAX_SPDM_MSG_SIZE;
     if ((m_use_responder_capability_flags & SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_CHUNK_CAP) == 0) {
         max_spdm_msg_size = LIBSPDM_RECEIVER_BUFFER_SIZE - LIBSPDM_TRANSPORT_ADDITIONAL_SIZE;
@@ -363,10 +367,8 @@ void spdm_server_connection_state_callback(
     bool res;
     void *data;
     void *data1;
-    void *data4;
     size_t data_size;
     size_t data1_size;
-    size_t data4_size;
     libspdm_data_parameter_t parameter;
     uint8_t data8;
     uint16_t data16;
@@ -513,13 +515,6 @@ void spdm_server_connection_state_callback(
                     &data1, &data1_size,
                     NULL, NULL);
 
-                /* slot 4 uses a different leaf key (multi-key example). */
-                res = libspdm_read_responder_public_certificate_chain_per_slot(
-                    4,
-                    m_use_hash_algo,
-                    m_use_asym_algo,
-                    &data4, &data4_size,
-                    NULL, NULL);
             }
             if (m_use_pqc_asym_algo != 0) {
                 if ((data32 & SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_ALIAS_CERT_CAP) == 0) {
@@ -543,30 +538,11 @@ void spdm_server_connection_state_callback(
                     &data1, &data1_size,
                     NULL, NULL);
 
-                /* slot 4 uses a different leaf key (multi-key example). */
-                res = libspdm_read_pqc_responder_public_certificate_chain_per_slot(
-                    4,
-                    m_use_hash_algo,
-                    m_use_pqc_asym_algo,
-                    &data4, &data4_size,
-                    NULL, NULL);
             }
             if ((m_use_asym_algo != 0) || (m_use_pqc_asym_algo != 0)) {
                 if (res) {
-                    /* Populate a NON-CONTIGUOUS set of slots. Slots 0 and 1 share the negotiated
-                     * algorithm's (single) leaf key. Slot 4 carries a DIFFERENT leaf key (data4) to
-                     * demonstrate multiple keys; it is provisioned ONLY in a multi-key connection.
-                     * In a non-multi-key connection (e.g. SPDM 1.1/1.2, or 1.3+ without multi-key),
-                     * the endpoint has a single key pair per algorithm (DSP0274), KeyPairID is
-                     * forced to 0, and the responder signs with the default key - so slot 4's
-                     * distinct key could not be authenticated and must not be offered.
-                     *
-                     * SlotIDs may be non-contiguous, but per DSP0274 KeyPairIDs are contiguous
-                     * 1..TotalKeyPairs and each KeyPairID has one fixed algorithm. Each slot's
-                     * KeyPairID is the REAL device-global id of the negotiated algorithm's key pair:
-                     * slots 0/1 use that algorithm's primary key pair, slot 4 its secondary
-                     * (resolved by libspdm_get_key_pair_id_by_slot). */
-                    static const uint8_t populated_slot_id[] = { 0, 1, 4 };
+                    /* Test slots: unrestricted SPDM key in 0, restricted AK in 1. */
+                    static const uint8_t populated_slot_id[] = { 0, 1 };
                     void *slot_data[3];
                     size_t slot_data_size[3];
                     size_t slot_index;
@@ -578,16 +554,10 @@ void spdm_server_connection_state_callback(
                     multi_key_conn_rsp = false;
                     libspdm_get_data(spdm_context, LIBSPDM_DATA_MULTI_KEY_CONN_RSP, &parameter,
                                      &multi_key_conn_rsp, &multi_key_data_size);
-                    /* slot 4 (the distinct-key example) is provisioned only when this
-                     * connection is multi-key; otherwise its cert chain data is empty,
-                     * so a long-lived responder never carries slot 4 over from an
-                     * earlier multi-key connection into a later non-multi-key one. */
                     slot_data[0] = data;
                     slot_data[1] = data1;
-                    slot_data[2] = multi_key_conn_rsp ? data4 : NULL;
                     slot_data_size[0] = data_size;
                     slot_data_size[1] = data1_size;
-                    slot_data_size[2] = multi_key_conn_rsp ? data4_size : 0;
                     populated_slot_count = (uint8_t)LIBSPDM_ARRAY_SIZE(populated_slot_id);
 
                     libspdm_zero_mem(&parameter, sizeof(parameter));
@@ -600,24 +570,23 @@ void spdm_server_connection_state_callback(
                                          LIBSPDM_DATA_LOCAL_PUBLIC_CERT_CHAIN,
                                          &parameter, slot_data[slot_index],
                                          slot_data_size[slot_index]);
-                        /* real, algorithm-matched, contiguous KeyPairID for this slot. */
-#if LIBSPDM_ENABLE_CAPABILITY_GET_KEY_PAIR_INFO_CAP
-                        data8 = libspdm_get_key_pair_id_by_slot(
-                            m_use_asym_algo, m_use_pqc_asym_algo, populated_slot_id[slot_index]);
-#else
-                        data8 = (uint8_t)(slot_index + 1);
-#endif
+                        /* Test mapping: slot 0 -> SPDM key 1, slot 1 -> AK 2. */
+                        data8 = populated_slot_id[slot_index] + 1;
                         libspdm_set_data(spdm_context,
                                          LIBSPDM_DATA_LOCAL_KEY_PAIR_ID,
                                          &parameter, &data8, sizeof(data8));
-                        data8 = SPDM_CERTIFICATE_INFO_CERT_MODEL_DEVICE_CERT;
+                        data8 = (populated_slot_id[slot_index] == 0) ?
+                                SPDM_CERTIFICATE_INFO_CERT_MODEL_DEVICE_CERT :
+                                SPDM_CERTIFICATE_INFO_CERT_MODEL_GENERIC_CERT;
                         libspdm_set_data(spdm_context,
                                          LIBSPDM_DATA_LOCAL_CERT_INFO,
                                          &parameter, &data8, sizeof(data8));
-                        data16 = SPDM_KEY_USAGE_BIT_MASK_KEY_EX_USE |
-                                SPDM_KEY_USAGE_BIT_MASK_CHALLENGE_USE |
-                                SPDM_KEY_USAGE_BIT_MASK_MEASUREMENT_USE |
-                                SPDM_KEY_USAGE_BIT_MASK_ENDPOINT_INFO_USE;
+                        data16 = (populated_slot_id[slot_index] == 0) ?
+                                (SPDM_KEY_USAGE_BIT_MASK_KEY_EX_USE |
+                                 SPDM_KEY_USAGE_BIT_MASK_CHALLENGE_USE |
+                                 SPDM_KEY_USAGE_BIT_MASK_MEASUREMENT_USE |
+                                 SPDM_KEY_USAGE_BIT_MASK_ENDPOINT_INFO_USE) :
+                                SPDM_KEY_USAGE_BIT_MASK_STANDARDS_KEY_USE;
                         libspdm_set_data(spdm_context,
                                          LIBSPDM_DATA_LOCAL_KEY_USAGE_BIT_MASK,
                                          &parameter, &data16, sizeof(data16));
@@ -748,13 +717,9 @@ void spdm_server_connection_state_callback(
 
         libspdm_zero_mem(&parameter, sizeof(parameter));
         parameter.location = LIBSPDM_DATA_LOCATION_LOCAL;
-        /* Slots 0 and 1 are always populated. Slot 4 (the distinct-key multi-key example, a
-         * non-contiguous SlotID; slots 2 and 3 stay empty) is only present in a multi-key
-         * connection. */
+        /* Expose both test certificate slots. */
         data8 = (1 << 0) | (1 << 1);
-        if (multi_key_conn_rsp) {
-            data8 |= (1 << 4);
-        }
+        /* Test profile exposes only SPDM slot 0 and quote slot 1. */
         libspdm_set_data(spdm_context, LIBSPDM_DATA_LOCAL_SUPPORTED_SLOT_MASK, &parameter,
                          &data8, sizeof(data8));
 
